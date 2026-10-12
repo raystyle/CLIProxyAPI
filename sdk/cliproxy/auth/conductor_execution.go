@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dialogobs"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -521,6 +522,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
+		dialogLogAuthSelection(ctx, auth, provider, routeModel, len(tried))
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
 		tried[auth.ID] = struct{}{}
@@ -733,6 +735,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
+		dialogLogAuthSelection(ctx, auth, provider, routeModel, len(tried))
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
 		tried[auth.ID] = struct{}{}
@@ -1034,6 +1037,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
+		dialogLogAuthSelection(ctx, auth, provider, routeModel, len(tried))
 		if selection != nil {
 			if errRuntimeAuth := m.bindHomeSelectionRuntimeAuth(ctx, opts, selection); errRuntimeAuth != nil {
 				selection.End("runtime_auth_bind_failed")
@@ -1858,6 +1862,32 @@ func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model 
 		ident := formatOauthIdentity(auth, provider, accountInfo)
 		entry.Debugf("Use OAuth %s for model %s%s", ident, model, suffix)
 	}
+}
+
+// dialogLogAuthSelection emits the credential selection (attempt index and
+// masked identity) to the dialog observation channel when enabled. It never
+// blocks the execution path.
+func dialogLogAuthSelection(ctx context.Context, auth *Auth, provider string, model string, attempt int) {
+	if !dialogobs.Enabled() {
+		return
+	}
+	hint := ""
+	if auth != nil {
+		accountType, accountInfo := auth.AccountInfo()
+		if accountType == "api_key" && accountInfo != "" {
+			hint = util.HideAPIKey(accountInfo)
+		} else {
+			hint = auth.ID
+		}
+	}
+	dialogobs.Emit(ctx, dialogobs.Event{
+		RequestID: logging.GetRequestID(ctx),
+		Kind:      dialogobs.KindUpstreamAttempt,
+		Attempt:   attempt,
+		AuthHint:  hint,
+		Provider:  provider,
+		Model:     model,
+	})
 }
 
 func formatOauthIdentity(auth *Auth, provider string, accountInfo string) string {

@@ -53,6 +53,18 @@ type SDKConfig struct {
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 
+	// DialogLog enables the asynchronous dialog observation channel: an
+	// append-only hourly JSONL stream (request bodies, response bytes,
+	// credential selections) written under the log directory for tail-based
+	// collection. It never blocks the request path; overflow drops events.
+	DialogLog bool `yaml:"dialog-log" json:"dialog-log"`
+
+	// DialogLogMaxTotalSizeMB bounds the total size of the dialog JSONL
+	// volume. When greater than zero, a rotation sweep deletes the oldest
+	// dialog files (never the active one) to stay within the budget. Zero
+	// disables the sweep, matching logs-max-total-size-mb semantics.
+	DialogLogMaxTotalSizeMB int `yaml:"dialog-log-max-total-size-mb" json:"dialog-log-max-total-size-mb"`
+
 	// CodexOrphanDelegationCompatibility mirrors the provider-wide runtime setting for API handlers.
 	CodexOrphanDelegationCompatibility bool `yaml:"-" json:"-"`
 

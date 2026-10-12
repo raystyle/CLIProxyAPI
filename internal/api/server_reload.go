@@ -3,12 +3,14 @@ package api
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dialogobs"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubauth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
@@ -69,6 +71,21 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 			s.loggerToggle(cfg.RequestLog)
 		} else if toggler, ok := s.requestLogger.(interface{ SetEnabled(bool) }); ok {
 			toggler.SetEnabled(cfg.RequestLog)
+		}
+	}
+
+	// Update dialog observation channel state if it has changed
+	previousDialogLog := false
+	if oldCfg != nil {
+		previousDialogLog = oldCfg.DialogLog
+	}
+	if oldCfg == nil || previousDialogLog != cfg.DialogLog {
+		if cfg.DialogLog {
+			if errDialog := dialogobs.Start(filepath.Join(logging.ResolveLogDirectory(cfg), "dialog"), cfg.DialogLogMaxTotalSizeMB); errDialog != nil {
+				log.WithError(errDialog).Warn("failed to start dialog observation channel")
+			}
+		} else {
+			dialogobs.Stop()
 		}
 	}
 

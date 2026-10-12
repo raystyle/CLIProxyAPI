@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
 	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/dialogobs"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubauth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
@@ -165,6 +167,13 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 			}
 		}
 	}
+
+	if cfg.DialogLog {
+		if errDialog := dialogobs.Start(filepath.Join(logging.ResolveLogDirectory(cfg), "dialog"), cfg.DialogLogMaxTotalSizeMB); errDialog != nil {
+			log.WithError(errDialog).Warn("failed to start dialog observation channel")
+		}
+	}
+	engine.Use(middleware.DialogObservationMiddleware())
 
 	engine.Use(corsMiddleware())
 	wd, err := os.Getwd()
@@ -409,6 +418,8 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+
+	dialogobs.Stop()
 
 	if s.keepAliveEnabled {
 		select {
