@@ -58,20 +58,38 @@ type Event struct {
 	Provider   string
 	Model      string
 	Payload    []byte
+	// Request-end enrichment: caller attribution and the final usage tally,
+	// filled by the observation middleware when emitting request_end.
+	Agent          string
+	SessionID      string
+	Alias          string
+	InputTokens    int64
+	OutputTokens   int64
+	CacheRead      int64
+	CacheCreation  int64
+	ThinkingTokens int64
 }
 
 type jsonLine struct {
-	TS         string `json:"ts"`
-	RequestID  string `json:"request_id,omitempty"`
-	Seq        uint32 `json:"seq"`
-	Kind       string `json:"kind"`
-	Status     int    `json:"status,omitempty"`
-	Attempt    int    `json:"attempt,omitempty"`
-	DurationMs int64  `json:"duration_ms,omitempty"`
-	AuthHint   string `json:"auth_hint,omitempty"`
-	Provider   string `json:"provider,omitempty"`
-	Model      string `json:"model,omitempty"`
-	Payload    string `json:"payload,omitempty"`
+	TS             string `json:"ts"`
+	RequestID      string `json:"request_id,omitempty"`
+	Seq            uint32 `json:"seq"`
+	Kind           string `json:"kind"`
+	Status         int    `json:"status,omitempty"`
+	Attempt        int    `json:"attempt,omitempty"`
+	DurationMs     int64  `json:"duration_ms,omitempty"`
+	AuthHint       string `json:"auth_hint,omitempty"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
+	Agent          string `json:"agent,omitempty"`
+	SessionID      string `json:"session_id,omitempty"`
+	Alias          string `json:"alias,omitempty"`
+	InputTokens    int64  `json:"input_tokens,omitempty"`
+	OutputTokens   int64  `json:"output_tokens,omitempty"`
+	CacheRead      int64  `json:"cache_read,omitempty"`
+	CacheCreation  int64  `json:"cache_creation,omitempty"`
+	ThinkingTokens int64  `json:"thinking_tokens,omitempty"`
+	Payload        string `json:"payload,omitempty"`
 }
 
 // seqKey carries the per-request sequence counter through the request context
@@ -180,7 +198,11 @@ func Emit(ctx context.Context, ev Event) {
 				Seq: seq, Kind: ev.Kind, Status: ev.Status, Attempt: ev.Attempt,
 				DurationMs: ev.DurationMs, AuthHint: ev.AuthHint,
 				Provider: ev.Provider, Model: ev.Model,
-				Payload: string(payload),
+				Agent: ev.Agent, SessionID: ev.SessionID, Alias: ev.Alias,
+				InputTokens: ev.InputTokens, OutputTokens: ev.OutputTokens,
+				CacheRead: ev.CacheRead, CacheCreation: ev.CacheCreation,
+				ThinkingTokens: ev.ThinkingTokens,
+				Payload:        string(payload),
 			})
 			if errMarshal == nil && len(line) <= maxLineBytes {
 				o.enqueueLine(line)
