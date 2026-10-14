@@ -55,6 +55,13 @@ func GinLogrusLogger() gin.HandlerFunc {
 				SetGinRequestID(c, requestID)
 				ctx := WithRequestID(c.Request.Context(), requestID)
 				c.Request = c.Request.WithContext(ctx)
+				// Echo the gateway request ID back to the client so external
+				// tooling can correlate a response with gateway logs and the
+				// dialog observation JSONL. Set only when absent so any value
+				// forwarded from upstream later in the handler chain wins.
+				if c.Writer.Header().Get("X-Request-Id") == "" {
+					c.Writer.Header().Set("X-Request-Id", requestID)
+				}
 			}
 		}
 
