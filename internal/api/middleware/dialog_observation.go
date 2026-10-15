@@ -3,7 +3,6 @@ package middleware
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"io"
 	"strings"
 	"time"
@@ -14,9 +13,20 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// maxModelScanBytes bounds the request body size for cheap "model" field
-// extraction; larger bodies skip the field rather than paying a full parse.
-const maxModelScanBytes = 256 * 1024
+// Scan gates: byte markers that must appear in a body before the gjson
+// lookups run, skipping bodies that cannot carry the field in one
+// memchr-class pass. Unlike the old size budget they never drop a field
+// that is actually present, whatever the body size.
+var (
+	userIDMarker  = []byte(`"user_id"`)
+	sessionMarker = []byte(`"session_id"`)
+	modelMarker   = []byte(`"model"`)
+)
+
+const (
+	maxClientNameLen = 64
+	agentDeviceChars = 8
+)
 
 // DialogObservationMiddleware emits the full conversation stream (client
 // request body, response bytes as written to the client, final status) to the
@@ -45,10 +55,12 @@ func DialogObservationMiddleware() gin.HandlerFunc {
 		}
 
 		requestID := logging.GetGinRequestID(c)
+		model := modelFromBody(body)
+		session, device := sessionAndDeviceFromBody(body)
 		dialogobs.Emit(ctx, dialogobs.Event{
 			RequestID: requestID,
 			Kind:      dialogobs.KindClientRequest,
-			Model:     modelFromBody(body),
+			Model:     model,
 			Payload:   body,
 		})
 
@@ -63,9 +75,9 @@ func DialogObservationMiddleware() gin.HandlerFunc {
 			Kind:           dialogobs.KindRequestEnd,
 			Status:         tee.finalStatus(),
 			DurationMs:     time.Since(start).Milliseconds(),
-			Agent:          agentFromUserAgent(c.Request.Header.Get("User-Agent")),
-			SessionID:      sessionFromBody(body),
-			Alias:          modelFromBody(body),
+			Agent:          agentIdentity(c.Request.Header.Get("X-Client-Name"), c.Request.Header.Get("User-Agent"), device),
+			SessionID:      session,
+			Alias:          model,
 			InputTokens:    tee.usage.input,
 			OutputTokens:   tee.usage.output,
 			CacheRead:      tee.usage.cacheRead,
@@ -131,18 +143,16 @@ func (w *dialogTeeWriter) finalStatus() int {
 }
 
 // modelFromBody extracts the "model" field for indexing without retaining the
-// body. Bodies beyond the scan budget are skipped.
+// body. The gjson lookup only walks top-level keys, so the cost stays bounded
+// by the distance to the field regardless of body size.
 func modelFromBody(body []byte) string {
-	if len(body) == 0 || len(body) > maxModelScanBytes {
+	if len(body) == 0 || body[0] != '{' || !bytes.Contains(body, modelMarker) {
 		return ""
 	}
-	var probe struct {
-		Model string `json:"model"`
+	if m := gjson.GetBytes(body, "model"); m.Type == gjson.String {
+		return m.String()
 	}
-	if err := json.Unmarshal(body, &probe); err != nil {
-		return ""
-	}
-	return probe.Model
+	return ""
 }
 
 // scanUsageData inspects response bytes for usage-bearing frames: SSE
@@ -212,25 +222,73 @@ func scanUsageJSON(payload []byte, u *usageSnapshot) {
 	}
 }
 
-// sessionFromBody extracts a client session identifier: Claude Code embeds a
-// session uuid after "session_" in metadata.user_id; codex-style clients send
-// a top-level session_id. Empty when neither is present or the body exceeds
-// the scan budget.
-func sessionFromBody(body []byte) string {
-	if len(body) == 0 || len(body) > maxModelScanBytes {
-		return ""
+// sessionAndDeviceFromBody extracts the client session and device identity
+// from the request body. Codex-style clients send a top-level session_id;
+// Claude Code embeds a session uuid after "session_" in metadata.user_id;
+// the GLM Claude Code builds send metadata.user_id as a JSON blob string
+// ({"device_id":...,"session_id":...}) — or object, which gjson renders back
+// as JSON text, so one parse covers both wire forms. No size budget: the
+// marker gates keep absent-field bodies at one pass, present fields are found
+// whatever the body size.
+func sessionAndDeviceFromBody(body []byte) (session, device string) {
+	if len(body) == 0 {
+		return "", ""
 	}
-	if sid := gjson.GetBytes(body, "session_id").String(); sid != "" {
-		return sid
+	if sid := gjson.GetBytes(body, "session_id"); sid.Type == gjson.String && sid.String() != "" {
+		return sid.String(), ""
+	}
+	if !bytes.Contains(body, userIDMarker) {
+		return "", ""
 	}
 	uid := gjson.GetBytes(body, "metadata.user_id").String()
+	if uid == "" {
+		return "", ""
+	}
+	if uid[0] == '{' {
+		blob := gjson.Parse(uid)
+		if blob.IsObject() {
+			if s := blob.Get("session_id"); s.Type == gjson.String {
+				session = s.String()
+			}
+			if d := blob.Get("device_id"); d.Type == gjson.String {
+				device = d.String()
+			}
+			return session, device
+		}
+	}
 	if idx := strings.LastIndex(uid, "session_"); idx >= 0 {
 		cand := strings.TrimSpace(uid[idx+len("session_"):])
 		if len(cand) >= 32 && len(cand) <= 36 {
-			return cand
+			return cand, ""
 		}
 	}
-	return ""
+	return "", ""
+}
+
+// agentIdentity picks the per-client value for the agent column: an explicit
+// X-Client-Name header (operator-set per workstation, e.g. via the Claude
+// Code custom-headers env) wins; otherwise the UA CLI family is annotated
+// with the device fingerprint from the identity blob ("claude@7fcd982e");
+// the bare UA mapping stays the fallback so the column never regresses.
+func agentIdentity(xClientName, ua, device string) string {
+	if name := strings.TrimSpace(xClientName); name != "" {
+		if len(name) > maxClientNameLen {
+			name = name[:maxClientNameLen]
+		}
+		return name
+	}
+	family := agentFromUserAgent(ua)
+	if family == "" {
+		family = "client"
+	}
+	if device != "" {
+		prefix := device
+		if len(prefix) > agentDeviceChars {
+			prefix = prefix[:agentDeviceChars]
+		}
+		return family + "@" + prefix
+	}
+	return family
 }
 
 // agentFromUserAgent maps the caller CLI from its User-Agent header
