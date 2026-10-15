@@ -375,18 +375,25 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			var event bytes.Buffer
 			var upstreamMessageID string
 			upstreamCompleted := false
-			flushEvent := func() bool {
-				if event.Len() == 0 {
-					return true
+			// Stream bootstrap hold: upstreams occasionally deliver fatal
+			// errors as SSE error events inside an HTTP 200 stream (zhipu
+			// 5h-window 1308 form). Complete events are held until the first
+			// content event proves the stream healthy; an error event during
+			// the hold is surfaced as a stream failure before any byte
+			// reaches the client, so the handler bootstrap retry can rotate
+			// credentials on a clean response.
+			holding := true
+			held := make([][]byte, 0, 4)
+			flushHeld := func() bool {
+				for _, frame := range held {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: frame}:
+					case <-ctx.Done():
+						return false
+					}
 				}
-				cloned := bytes.Clone(event.Bytes())
-				event.Reset()
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: cloned}:
-					return true
-				case <-ctx.Done():
-					return false
-				}
+				held = held[:0]
+				return true
 			}
 			for scanner.Scan() {
 				line := scanner.Bytes()
@@ -403,18 +410,59 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				event.Write(line)
 				event.WriteByte('\n')
 				if len(bytes.TrimSpace(line)) == 0 {
-					if !flushEvent() {
-						emitCancellation(ctx.Err())
-						return
+					if event.Len() == 0 {
+						if upstreamCompleted {
+							break
+						}
+						continue
+					}
+					cloned := bytes.Clone(event.Bytes())
+					event.Reset()
+					if holding {
+						if claudeStreamEventIsError(cloned) {
+							emitResponseError(claudeInStreamErrorEventError(cloned))
+							return
+						}
+						held = append(held, cloned)
+						if claudeStreamEventStartsContent(cloned) || len(held) >= maxClaudeStreamHeldEvents {
+							holding = false
+							if !flushHeld() {
+								emitCancellation(ctx.Err())
+								return
+							}
+						}
+					} else {
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Payload: cloned}:
+						case <-ctx.Done():
+							emitCancellation(ctx.Err())
+							return
+						}
 					}
 					if upstreamCompleted {
 						break
 					}
 				}
 			}
-			if !flushEvent() {
-				emitCancellation(ctx.Err())
-				return
+			// Stream ended: release anything still held (short streams may
+			// never produce a content event) before the trailing partial
+			// event, so consumers always observe the complete byte stream.
+			if holding && len(held) > 0 {
+				holding = false
+				if !flushHeld() {
+					emitCancellation(ctx.Err())
+					return
+				}
+			}
+			if event.Len() > 0 {
+				cloned := bytes.Clone(event.Bytes())
+				event.Reset()
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: cloned}:
+				case <-ctx.Done():
+					emitCancellation(ctx.Err())
+					return
+				}
 			}
 			if !upstreamCompleted {
 				if emitCancellation(scanner.Err()) {
@@ -574,4 +622,79 @@ func validateClaudeStreamingResponse(data []byte) error {
 		return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream response ended before message completion"}
 	}
 	return nil
+}
+
+// maxClaudeStreamHeldEvents bounds the stream bootstrap hold: once this many
+// complete events have been held without a content event, holding ends and
+// buffered events are delivered regardless.
+const maxClaudeStreamHeldEvents = 8
+
+// claudeStreamEventIsError reports whether a buffered complete SSE event is
+// an upstream error event ("event: error" or a data payload of type error).
+func claudeStreamEventIsError(frame []byte) bool {
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if bytes.HasPrefix(line, []byte("event:")) {
+			if strings.TrimSpace(string(line[len("event:"):])) == "error" {
+				return true
+			}
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("data:")) {
+			payload := bytes.TrimSpace(line[len("data:"):])
+			if len(payload) > 0 && gjson.ParseBytes(payload).Get("type").String() == "error" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// claudeStreamEventStartsContent reports whether a buffered event begins
+// content delivery; the stream is proven healthy and holding ends.
+func claudeStreamEventStartsContent(frame []byte) bool {
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[len("data:"):])
+		if len(payload) == 0 {
+			continue
+		}
+		switch gjson.ParseBytes(payload).Get("type").String() {
+		case "content_block_start", "content_block_delta":
+			return true
+		}
+	}
+	return false
+}
+
+// claudeInStreamErrorEventError converts a held upstream error event into an
+// execution error. Rate-limit shaped bodies map to the credential-rotating
+// 429 path so the handler bootstrap retry picks the next key; anything else
+// becomes a bad gateway carrying the upstream body.
+func claudeInStreamErrorEventError(frame []byte) error {
+	if claudeStreamEventIsRateLimit(frame) {
+		return claudeRateLimitError{statusErr: statusErr{code: http.StatusTooManyRequests, msg: string(frame)}}
+	}
+	return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned in-stream error event: " + string(frame)}
+}
+
+func claudeStreamEventIsRateLimit(frame []byte) bool {
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[len("data:"):])
+		if len(payload) == 0 {
+			continue
+		}
+		root := gjson.ParseBytes(payload)
+		if root.Get("type").String() == "error" && root.Get("error.type").String() == "rate_limit_error" {
+			return true
+		}
+	}
+	return false
 }
