@@ -2,6 +2,7 @@ package dialogobs
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -126,6 +127,57 @@ func TestConcurrentEmitDoesNotBlock(t *testing.T) {
 	Stop()
 	if got := len(readAllLines(t, dir)) + int(Dropped()); got != 16*200 {
 		t.Fatalf("expected written+dropped == %d, got written lines + %d drops", 16*200, Dropped())
+	}
+}
+
+func TestEmitBisectPreservesAllBytes(t *testing.T) {
+	dir := t.TempDir()
+	if errStart := Start(dir, 0); errStart != nil {
+		t.Fatalf("start: %v", errStart)
+	}
+	ctx := WithSeq(context.Background())
+	// Control bytes (0x00-0x08, excluding \t \n \r) marshal to six-byte
+	// \u00XX escapes, forcing every default chunk past the line budget and
+	// down the bisection path.
+	payload := make([]byte, defaultChunkBytes*3+7)
+	for i := range payload {
+		payload[i] = byte(i % 9)
+	}
+	Emit(ctx, Event{RequestID: "rid-bisect", Kind: KindSSE, Payload: payload})
+	Stop()
+	var joined []byte
+	for _, line := range readAllLines(t, dir) {
+		if line.Kind != KindSSE {
+			t.Fatalf("unexpected kind: %+v", line)
+		}
+		if line.PayloadTruncated {
+			t.Fatal("unexpected truncation flag on in-budget payload")
+		}
+		joined = append(joined, line.Payload...)
+	}
+	if !bytes.Equal(joined, payload) {
+		t.Fatalf("bisected payload roundtrip mismatch: got %d bytes, want %d", len(joined), len(payload))
+	}
+}
+
+func TestEmitPayloadCapFlagsTruncation(t *testing.T) {
+	dir := t.TempDir()
+	if errStart := Start(dir, 0); errStart != nil {
+		t.Fatalf("start: %v", errStart)
+	}
+	ctx := WithSeq(context.Background())
+	payload := bytes.Repeat([]byte("x"), maxEmitPayloadBytes+13)
+	Emit(ctx, Event{RequestID: "rid-cap", Kind: KindClientRequest, Payload: payload})
+	Stop()
+	emitted := 0
+	for _, line := range readAllLines(t, dir) {
+		if !line.PayloadTruncated {
+			t.Fatal("expected payload_truncated on every line of the capped event")
+		}
+		emitted += len(line.Payload)
+	}
+	if emitted != maxEmitPayloadBytes {
+		t.Fatalf("expected %d emitted bytes, got %d", maxEmitPayloadBytes, emitted)
 	}
 }
 

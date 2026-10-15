@@ -7,9 +7,11 @@
 // Output format: one JSON object per line in hourly files named
 // dialog-YYYYMMDD-HH.jsonl under the configured directory. Payloads are
 // chunked so no line exceeds maxLineBytes, which keeps vector file sources
-// (default 102400-byte line cap) from dropping records. Payload bytes are
-// stored as UTF-8 strings; invalid UTF-8 sequences are replaced per
-// encoding/json semantics.
+// (default 102400-byte line cap) from dropping records. Payloads beyond
+// maxEmitPayloadBytes are emitted as a prefix flagged with
+// payload_truncated, so one oversized body cannot flood the queue. Payload
+// bytes are stored as UTF-8 strings; invalid UTF-8 sequences are replaced
+// per encoding/json semantics.
 package dialogobs
 
 import (
@@ -39,10 +41,15 @@ const (
 	maxLineBytes = 64 * 1024
 	// defaultChunkBytes is the initial raw payload slice size. JSON escaping
 	// can inflate a chunk, so chunks start well below maxLineBytes and are
-	// halved when a marshalled line still exceeds the budget.
+	// bisected when a marshalled line still exceeds the budget.
 	defaultChunkBytes = 32 * 1024
 	// defaultQueueSize bounds the asynchronous event queue.
 	defaultQueueSize = 8192
+	// maxEmitPayloadBytes caps how much payload a single event may enqueue.
+	// Beyond the cap the payload is emitted as a prefix flagged with
+	// payload_truncated; this keeps one oversized body from flooding the
+	// bounded queue and starving other requests' events.
+	maxEmitPayloadBytes = 8 << 20
 )
 
 // Event is a single observation record. Payload may exceed the line budget;
@@ -58,6 +65,10 @@ type Event struct {
 	Provider   string
 	Model      string
 	Payload    []byte
+	// PayloadTruncated is set by Emit when the payload exceeded
+	// maxEmitPayloadBytes and was cut to its prefix. Readers reassembling
+	// payloads must not treat the result as the full original body.
+	PayloadTruncated bool
 	// Request-end enrichment: caller attribution and the final usage tally,
 	// filled by the observation middleware when emitting request_end.
 	Agent          string
@@ -71,25 +82,26 @@ type Event struct {
 }
 
 type jsonLine struct {
-	TS             string `json:"ts"`
-	RequestID      string `json:"request_id,omitempty"`
-	Seq            uint32 `json:"seq"`
-	Kind           string `json:"kind"`
-	Status         int    `json:"status,omitempty"`
-	Attempt        int    `json:"attempt,omitempty"`
-	DurationMs     int64  `json:"duration_ms,omitempty"`
-	AuthHint       string `json:"auth_hint,omitempty"`
-	Provider       string `json:"provider,omitempty"`
-	Model          string `json:"model,omitempty"`
-	Agent          string `json:"agent,omitempty"`
-	SessionID      string `json:"session_id,omitempty"`
-	Alias          string `json:"alias,omitempty"`
-	InputTokens    int64  `json:"input_tokens,omitempty"`
-	OutputTokens   int64  `json:"output_tokens,omitempty"`
-	CacheRead      int64  `json:"cache_read,omitempty"`
-	CacheCreation  int64  `json:"cache_creation,omitempty"`
-	ThinkingTokens int64  `json:"thinking_tokens,omitempty"`
-	Payload        string `json:"payload,omitempty"`
+	TS               string `json:"ts"`
+	RequestID        string `json:"request_id,omitempty"`
+	Seq              uint32 `json:"seq"`
+	Kind             string `json:"kind"`
+	Status           int    `json:"status,omitempty"`
+	Attempt          int    `json:"attempt,omitempty"`
+	DurationMs       int64  `json:"duration_ms,omitempty"`
+	AuthHint         string `json:"auth_hint,omitempty"`
+	Provider         string `json:"provider,omitempty"`
+	Model            string `json:"model,omitempty"`
+	Agent            string `json:"agent,omitempty"`
+	SessionID        string `json:"session_id,omitempty"`
+	Alias            string `json:"alias,omitempty"`
+	InputTokens      int64  `json:"input_tokens,omitempty"`
+	OutputTokens     int64  `json:"output_tokens,omitempty"`
+	CacheRead        int64  `json:"cache_read,omitempty"`
+	CacheCreation    int64  `json:"cache_creation,omitempty"`
+	ThinkingTokens   int64  `json:"thinking_tokens,omitempty"`
+	Payload          string `json:"payload,omitempty"`
+	PayloadTruncated bool   `json:"payload_truncated,omitempty"`
 }
 
 // seqKey carries the per-request sequence counter through the request context
@@ -178,10 +190,12 @@ func Dropped() uint64 {
 	return 0
 }
 
-// Emit enqueues an event without blocking the caller. Payload chunks larger
-// than the line budget are split across sequential seq numbers. Events are
-// dropped (and counted) when the queue is full; this never affects request
-// handling.
+// Emit enqueues an event without blocking the caller. Payloads beyond
+// maxEmitPayloadBytes are emitted as a prefix flagged with
+// payload_truncated. Chunks whose marshalled line exceeds the line budget
+// are bisected with both halves emitted in order, so reassembly by seq
+// reproduces the emitted payload byte-for-byte. Events are dropped (and
+// counted) when the queue is full; this never affects request handling.
 func Emit(ctx context.Context, ev Event) {
 	o := defaultObserver.Load()
 	if o == nil {
@@ -190,33 +204,38 @@ func Emit(ctx context.Context, ev Event) {
 	if ev.Time.IsZero() {
 		ev.Time = time.Now()
 	}
-	emitChunk := func(payload []byte) {
-		for {
-			seq := nextSeq(ctx)
-			line, errMarshal := json.Marshal(jsonLine{
-				TS: ev.Time.UTC().Format(time.RFC3339Nano), RequestID: ev.RequestID,
-				Seq: seq, Kind: ev.Kind, Status: ev.Status, Attempt: ev.Attempt,
-				DurationMs: ev.DurationMs, AuthHint: ev.AuthHint,
-				Provider: ev.Provider, Model: ev.Model,
-				Agent: ev.Agent, SessionID: ev.SessionID, Alias: ev.Alias,
-				InputTokens: ev.InputTokens, OutputTokens: ev.OutputTokens,
-				CacheRead: ev.CacheRead, CacheCreation: ev.CacheCreation,
-				ThinkingTokens: ev.ThinkingTokens,
-				Payload:        string(payload),
-			})
-			if errMarshal == nil && len(line) <= maxLineBytes {
-				o.enqueueLine(line)
-				return
-			}
-			half := len(payload) / 2
-			if half < 1 {
-				// A single byte still exceeds the budget (only possible for
-				// pathological escape amplification); drop rather than block.
-				o.countDrop()
-				return
-			}
-			payload = payload[:half]
+	if len(ev.Payload) > maxEmitPayloadBytes {
+		ev.Payload = ev.Payload[:maxEmitPayloadBytes]
+		ev.PayloadTruncated = true
+	}
+	var emitChunk func(payload []byte)
+	emitChunk = func(payload []byte) {
+		seq := nextSeq(ctx)
+		line, errMarshal := json.Marshal(jsonLine{
+			TS: ev.Time.UTC().Format(time.RFC3339Nano), RequestID: ev.RequestID,
+			Seq: seq, Kind: ev.Kind, Status: ev.Status, Attempt: ev.Attempt,
+			DurationMs: ev.DurationMs, AuthHint: ev.AuthHint,
+			Provider: ev.Provider, Model: ev.Model,
+			Agent: ev.Agent, SessionID: ev.SessionID, Alias: ev.Alias,
+			InputTokens: ev.InputTokens, OutputTokens: ev.OutputTokens,
+			CacheRead: ev.CacheRead, CacheCreation: ev.CacheCreation,
+			ThinkingTokens:   ev.ThinkingTokens,
+			PayloadTruncated: ev.PayloadTruncated,
+			Payload:          string(payload),
+		})
+		if errMarshal == nil && len(line) <= maxLineBytes {
+			o.enqueueLine(line)
+			return
 		}
+		half := len(payload) / 2
+		if half < 1 {
+			// A single byte still exceeds the budget (only possible for
+			// pathological escape amplification); drop rather than block.
+			o.countDrop()
+			return
+		}
+		emitChunk(payload[:half])
+		emitChunk(payload[half:])
 	}
 	if len(ev.Payload) == 0 {
 		emitChunk(nil)
@@ -283,12 +302,15 @@ func (o *observer) run() {
 			if f := ensureFile(time.Now()); f != nil {
 				if _, errWrite := f.Write(append(line, '\n')); errWrite != nil {
 					writeErrCount++
+					o.countDrop()
 					if writeErrCount%100 == 1 {
 						log.WithError(errWrite).Warn("dialog observation write failed")
 					}
 				} else {
 					o.written.Add(1)
 				}
+			} else {
+				o.countDrop()
 			}
 		case <-ticker.C:
 			if o.maxBytes > 0 && file != nil {
