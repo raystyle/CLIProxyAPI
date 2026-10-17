@@ -169,7 +169,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 
 	if cfg.DialogLog {
-		if errDialog := dialogobs.Start(filepath.Join(logging.ResolveLogDirectory(cfg), "dialog"), cfg.DialogLogMaxTotalSizeMB); errDialog != nil {
+		if errDialog := dialogobs.Start(filepath.Join(logging.ResolveLogDirectory(cfg), "dialog"), cfg.DialogLogMaxTotalSizeMB, cfg.DialogLogMinAgeMinutes); errDialog != nil {
 			log.WithError(errDialog).Warn("failed to start dialog observation channel")
 		}
 	}

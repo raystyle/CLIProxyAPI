@@ -134,6 +134,7 @@ type observer struct {
 	stop     chan struct{}
 	done     chan struct{}
 	maxBytes int64
+	minAge   time.Duration
 	dropped  atomic.Uint64
 	written  atomic.Uint64
 }
@@ -149,8 +150,13 @@ func Enabled() bool {
 // dir. When maxTotalSizeMB is greater than zero, a rotation sweep runs every
 // minute and deletes the oldest dialog JSONL files (never the active one) to
 // keep the volume within the budget, mirroring the logs-max-total-size-mb
-// behaviour of the application log directory. Start is idempotent.
-func Start(dir string, maxTotalSizeMB int) error {
+// behaviour of the application log directory. When minAgeMinutes is greater
+// than zero, the sweep additionally never deletes a file whose last
+// modification is more recent than that age, so a retention window survives
+// even when a single heavy hour alone exceeds the whole budget. Because files
+// rotate hourly, the young-file overshoot is bounded to about one extra file.
+// Start is idempotent.
+func Start(dir string, maxTotalSizeMB int, minAgeMinutes int) error {
 	if Enabled() {
 		return nil
 	}
@@ -163,12 +169,13 @@ func Start(dir string, maxTotalSizeMB int) error {
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 		maxBytes: int64(maxTotalSizeMB) * 1024 * 1024,
+		minAge:   time.Duration(minAgeMinutes) * time.Minute,
 	}
 	if !defaultObserver.CompareAndSwap(nil, o) {
 		return nil
 	}
 	go o.run()
-	log.WithField("dir", dir).WithField("max_total_size_mb", maxTotalSizeMB).Info("dialog observation channel started")
+	log.WithField("dir", dir).WithField("max_total_size_mb", maxTotalSizeMB).WithField("min_age_minutes", minAgeMinutes).Info("dialog observation channel started")
 	return nil
 }
 
@@ -314,7 +321,7 @@ func (o *observer) run() {
 			}
 		case <-ticker.C:
 			if o.maxBytes > 0 && file != nil {
-				if _, errSweep := enforceDialogDirSizeLimit(o.dir, o.maxBytes, filepath.Join(o.dir, "dialog-"+time.Now().Format("20060102-15")+".jsonl")); errSweep != nil {
+				if _, errSweep := enforceDialogDirSizeLimit(o.dir, o.maxBytes, filepath.Join(o.dir, "dialog-"+time.Now().Format("20060102-15")+".jsonl"), o.minAge); errSweep != nil {
 					log.WithError(errSweep).Warn("dialog observation size sweep failed")
 				}
 			}
@@ -341,8 +348,11 @@ func (o *observer) run() {
 
 // enforceDialogDirSizeLimit deletes the oldest dialog JSONL files until the
 // total size is within maxBytes. The active (protected) file is never removed,
-// mirroring the application log directory cleaner.
-func enforceDialogDirSizeLimit(dir string, maxBytes int64, protectedPath string) (int, error) {
+// mirroring the application log directory cleaner. When minAge is greater
+// than zero, files modified within the last minAge are also kept, trading a
+// bounded budget overshoot (about one extra hourly file) for a guaranteed
+// retention window.
+func enforceDialogDirSizeLimit(dir string, maxBytes int64, protectedPath string, minAge time.Duration) (int, error) {
 	if maxBytes <= 0 {
 		return 0, nil
 	}
@@ -357,9 +367,11 @@ func enforceDialogDirSizeLimit(dir string, maxBytes int64, protectedPath string)
 	if protectedPath != "" {
 		protected = filepath.Clean(protectedPath)
 	}
+	cutoff := time.Now().Add(-minAge)
 	type logFile struct {
-		path string
-		size int64
+		path    string
+		size    int64
+		modTime time.Time
 	}
 	var files []logFile
 	var total int64
@@ -375,7 +387,7 @@ func enforceDialogDirSizeLimit(dir string, maxBytes int64, protectedPath string)
 		if errInfo != nil || !info.Mode().IsRegular() {
 			continue
 		}
-		files = append(files, logFile{path: filepath.Join(dir, name), size: info.Size()})
+		files = append(files, logFile{path: filepath.Join(dir, name), size: info.Size(), modTime: info.ModTime()})
 		total += info.Size()
 	}
 	if total <= maxBytes {
@@ -388,6 +400,9 @@ func enforceDialogDirSizeLimit(dir string, maxBytes int64, protectedPath string)
 			break
 		}
 		if protected != "" && filepath.Clean(file.path) == protected {
+			continue
+		}
+		if minAge > 0 && file.modTime.After(cutoff) {
 			continue
 		}
 		if errRemove := os.Remove(file.path); errRemove != nil {

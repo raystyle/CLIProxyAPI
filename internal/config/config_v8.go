@@ -103,7 +103,7 @@ func buildV8Paths() []configPath {
 		{"disable-image-generation", "multimedia.disable-image-generation"}, {"gpt-image-2-base-model", "multimedia.gpt-image-2-base-model"},
 		{"video-result-auth-cache-ttl", "multimedia.video-result-auth-cache-ttl"},
 		{"debug", "observability.logs.debug"}, {"logging-to-file", "observability.logs.logging-to-file"},
-		{"logs-max-total-size-mb", "observability.logs.logs-max-total-size-mb"}, {"request-log", "observability.logs.request-log"}, {"dialog-log", "observability.logs.dialog-log"}, {"dialog-log-max-total-size-mb", "observability.logs.dialog-log-max-total-size-mb"},
+		{"logs-max-total-size-mb", "observability.logs.logs-max-total-size-mb"}, {"request-log", "observability.logs.request-log"}, {"dialog-log", "observability.logs.dialog-log"}, {"dialog-log-max-total-size-mb", "observability.logs.dialog-log-max-total-size-mb"}, {"dialog-log-min-age-minutes", "observability.logs.dialog-log-min-age-minutes"},
 		{"error-logs-max-files", "observability.logs.error-logs-max-files"},
 		{"usage-statistics-enabled", "observability.usage.usage-statistics-enabled"},
 		{"redis-usage-queue-retention-seconds", "observability.usage.redis-usage-queue-retention-seconds"}, {"pprof", "observability.pprof"},

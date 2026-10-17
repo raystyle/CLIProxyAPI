@@ -88,6 +88,10 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		cfg.LogsMaxTotalSizeMB = 0
 	}
 
+	if cfg.DialogLogMinAgeMinutes < 0 {
+		cfg.DialogLogMinAgeMinutes = 0
+	}
+
 	if cfg.ErrorLogsMaxFiles < 0 {
 		cfg.ErrorLogsMaxFiles = 10
 	}

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func readAllLines(t *testing.T, dir string) []jsonLine {
@@ -46,7 +47,7 @@ func readAllLines(t *testing.T, dir string) []jsonLine {
 
 func TestStartEmitStopRoundtrip(t *testing.T) {
 	dir := t.TempDir()
-	if errStart := Start(dir, 0); errStart != nil {
+	if errStart := Start(dir, 0, 0); errStart != nil {
 		t.Fatalf("start: %v", errStart)
 	}
 	if !Enabled() {
@@ -80,7 +81,7 @@ func TestStartEmitStopRoundtrip(t *testing.T) {
 
 func TestPayloadChunkingKeepsLineBudget(t *testing.T) {
 	dir := t.TempDir()
-	if errStart := Start(dir, 0); errStart != nil {
+	if errStart := Start(dir, 0, 0); errStart != nil {
 		t.Fatalf("start: %v", errStart)
 	}
 	ctx := WithSeq(context.Background())
@@ -109,7 +110,7 @@ func TestDisabledEmitIsNoop(t *testing.T) {
 
 func TestConcurrentEmitDoesNotBlock(t *testing.T) {
 	dir := t.TempDir()
-	if errStart := Start(dir, 0); errStart != nil {
+	if errStart := Start(dir, 0, 0); errStart != nil {
 		t.Fatalf("start: %v", errStart)
 	}
 	ctx := WithSeq(context.Background())
@@ -132,7 +133,7 @@ func TestConcurrentEmitDoesNotBlock(t *testing.T) {
 
 func TestEmitBisectPreservesAllBytes(t *testing.T) {
 	dir := t.TempDir()
-	if errStart := Start(dir, 0); errStart != nil {
+	if errStart := Start(dir, 0, 0); errStart != nil {
 		t.Fatalf("start: %v", errStart)
 	}
 	ctx := WithSeq(context.Background())
@@ -162,7 +163,7 @@ func TestEmitBisectPreservesAllBytes(t *testing.T) {
 
 func TestEmitPayloadCapFlagsTruncation(t *testing.T) {
 	dir := t.TempDir()
-	if errStart := Start(dir, 0); errStart != nil {
+	if errStart := Start(dir, 0, 0); errStart != nil {
 		t.Fatalf("start: %v", errStart)
 	}
 	ctx := WithSeq(context.Background())
@@ -183,10 +184,10 @@ func TestEmitPayloadCapFlagsTruncation(t *testing.T) {
 
 func TestStartIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	if errStart := Start(dir, 0); errStart != nil {
+	if errStart := Start(dir, 0, 0); errStart != nil {
 		t.Fatalf("start: %v", errStart)
 	}
-	if errSecond := Start(dir, 0); errSecond != nil {
+	if errSecond := Start(dir, 0, 0); errSecond != nil {
 		t.Fatalf("second start: %v", errSecond)
 	}
 	Stop()
@@ -204,7 +205,7 @@ func TestSizeLimitSweepDeletesOldestKeepsActive(t *testing.T) {
 	write("dialog-20260101-01.jsonl", strings.Repeat("b", 4000))
 	write("dialog-20260101-02.jsonl", strings.Repeat("c", 4000))
 	// Budget fits one old file plus the protected active file.
-	deleted, errSweep := enforceDialogDirSizeLimit(dir, 8000, filepath.Join(dir, "dialog-20260101-02.jsonl"))
+	deleted, errSweep := enforceDialogDirSizeLimit(dir, 8000, filepath.Join(dir, "dialog-20260101-02.jsonl"), 0)
 	if errSweep != nil {
 		t.Fatalf("sweep: %v", errSweep)
 	}
@@ -219,5 +220,45 @@ func TestSizeLimitSweepDeletesOldestKeepsActive(t *testing.T) {
 	}
 	if _, errStat := os.Stat(filepath.Join(dir, "dialog-20260101-02.jsonl")); errStat != nil {
 		t.Fatal("expected active file kept")
+	}
+}
+
+func TestSizeLimitSweepMinAgeProtectsYoungFiles(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string, age time.Duration) {
+		path := filepath.Join(dir, name)
+		if errWrite := os.WriteFile(path, []byte(content), 0o644); errWrite != nil {
+			t.Fatalf("write %s: %v", name, errWrite)
+		}
+		stamp := time.Now().Add(-age)
+		if errChtimes := os.Chtimes(path, stamp, stamp); errChtimes != nil {
+			t.Fatalf("chtimes %s: %v", name, errChtimes)
+		}
+	}
+	// Total volume far exceeds the budget; without the age floor every
+	// non-active file would be deleted. The floor must keep the young
+	// rolled-over file while the old ones still go.
+	write("dialog-20260101-00.jsonl", strings.Repeat("a", 4000), 4*time.Hour)
+	write("dialog-20260101-01.jsonl", strings.Repeat("b", 4000), 3*time.Hour)
+	write("dialog-20260101-02.jsonl", strings.Repeat("c", 4000), 30*time.Minute)
+	active := filepath.Join(dir, "dialog-20260101-03.jsonl")
+	write("dialog-20260101-03.jsonl", strings.Repeat("d", 4000), 0)
+	deleted, errSweep := enforceDialogDirSizeLimit(dir, 1000, active, 2*time.Hour)
+	if errSweep != nil {
+		t.Fatalf("sweep: %v", errSweep)
+	}
+	if deleted != 2 {
+		t.Fatalf("expected 2 deletions, got %d", deleted)
+	}
+	for name, want := range map[string]bool{
+		"dialog-20260101-00.jsonl": false, // old, deleted
+		"dialog-20260101-01.jsonl": false, // old, deleted
+		"dialog-20260101-02.jsonl": true,  // young, protected by floor
+		"dialog-20260101-03.jsonl": true,  // active, protected
+	} {
+		_, errStat := os.Stat(filepath.Join(dir, name))
+		if got := errStat == nil; got != want {
+			t.Fatalf("file %s: exists=%v, want exists=%v", name, got, want)
+		}
 	}
 }

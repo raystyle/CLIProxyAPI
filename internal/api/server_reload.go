@@ -74,19 +74,21 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		}
 	}
 
-	// Update dialog observation channel state if it has changed. Either
-	// dialog setting changing recreates the channel, so a new size budget
-	// takes effect on reload, not only a toggle flip.
+	// Update dialog observation channel state if it has changed. Any dialog
+	// setting changing recreates the channel, so a new size budget or age
+	// floor takes effect on reload, not only a toggle flip.
 	previousDialogLog := false
 	previousDialogMaxMB := 0
+	previousDialogMinAge := 0
 	if oldCfg != nil {
 		previousDialogLog = oldCfg.DialogLog
 		previousDialogMaxMB = oldCfg.DialogLogMaxTotalSizeMB
+		previousDialogMinAge = oldCfg.DialogLogMinAgeMinutes
 	}
-	if oldCfg == nil || previousDialogLog != cfg.DialogLog || previousDialogMaxMB != cfg.DialogLogMaxTotalSizeMB {
+	if oldCfg == nil || previousDialogLog != cfg.DialogLog || previousDialogMaxMB != cfg.DialogLogMaxTotalSizeMB || previousDialogMinAge != cfg.DialogLogMinAgeMinutes {
 		dialogobs.Stop()
 		if cfg.DialogLog {
-			if errDialog := dialogobs.Start(filepath.Join(logging.ResolveLogDirectory(cfg), "dialog"), cfg.DialogLogMaxTotalSizeMB); errDialog != nil {
+			if errDialog := dialogobs.Start(filepath.Join(logging.ResolveLogDirectory(cfg), "dialog"), cfg.DialogLogMaxTotalSizeMB, cfg.DialogLogMinAgeMinutes); errDialog != nil {
 				log.WithError(errDialog).Warn("failed to start dialog observation channel")
 			}
 		}

@@ -65,6 +65,12 @@ type SDKConfig struct {
 	// disables the sweep, matching logs-max-total-size-mb semantics.
 	DialogLogMaxTotalSizeMB int `yaml:"dialog-log-max-total-size-mb" json:"dialog-log-max-total-size-mb"`
 
+	// DialogLogMinAgeMinutes protects rolled-over dialog files younger than
+	// this many minutes from the size sweep, so a retention window survives
+	// even when a single heavy hour alone exceeds the whole budget. Zero
+	// keeps the previous behaviour (budget only, no age floor).
+	DialogLogMinAgeMinutes int `yaml:"dialog-log-min-age-minutes" json:"dialog-log-min-age-minutes"`
+
 	// CodexOrphanDelegationCompatibility mirrors the provider-wide runtime setting for API handlers.
 	CodexOrphanDelegationCompatibility bool `yaml:"-" json:"-"`
 
