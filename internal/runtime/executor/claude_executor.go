@@ -79,7 +79,71 @@ func sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx context.Context, body 
 		sanitized, report = sigcompat.SanitizeClaudeMessagesForClaudeUpstream(body, baseModel, preserveEmptyThinkingBlocks...)
 		logClaudeSignatureSanitizeReport(ctx, baseModel, report)
 	}
-	return helps.NormalizeClaudeToolCallIDs(sanitizeClaudeWebSearchDomains(sanitized))
+	return helps.NormalizeClaudeToolCallIDs(sanitizeClaudeImageBlocks(sanitizeClaudeWebSearchDomains(sanitized)))
+}
+
+// claudeTextOnlyImagePlaceholder replaces image content blocks on their way to
+// text-only Anthropic-compatible upstreams. GLM's /api/anthropic face rejects
+// content.type outside ['text'] (tool_use/tool_result/thinking pass, image does
+// not) with a hard 400, which bricks any client session once a Read on an image
+// file lands in history (2026-10-20 lan-win incident: 40 consecutive 400s).
+// The placeholder keeps the request legal and the omission visible to the
+// model. Fleet fork note: applied unconditionally on this executor because
+// every claude-api-key upstream here is a text-only compat face; if a genuine
+// Anthropic (vision-capable) upstream is ever added, gate this on
+// isAnthropicUpstreamURL before forwarding.
+const claudeTextOnlyImagePlaceholder = "[image omitted: text-only upstream]"
+
+// sanitizeClaudeImageBlocks walks messages.content and nested tool_result
+// content arrays, replacing every image block with a text placeholder.
+func sanitizeClaudeImageBlocks(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+	var targets []string
+	messages.ForEach(func(mi, message gjson.Result) bool {
+		content := message.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(ci, block gjson.Result) bool {
+			switch block.Get("type").String() {
+			case "image":
+				targets = append(targets, fmt.Sprintf("messages.%d.content.%d", mi.Int(), ci.Int()))
+			case "tool_result":
+				nested := block.Get("content")
+				if nested.Exists() && nested.IsArray() {
+					nested.ForEach(func(ni, nestedBlock gjson.Result) bool {
+						if nestedBlock.Get("type").String() == "image" {
+							targets = append(targets, fmt.Sprintf("messages.%d.content.%d.content.%d", mi.Int(), ci.Int(), ni.Int()))
+						}
+						return true
+					})
+				}
+			}
+			return true
+		})
+		return true
+	})
+	if len(targets) == 0 {
+		return body
+	}
+	for _, path := range targets {
+		if updated, errSet := sjson.SetBytes(body, path, map[string]any{
+			"type": "text",
+			"text": claudeTextOnlyImagePlaceholder,
+		}); errSet == nil {
+			body = updated
+		}
+	}
+	log.WithFields(log.Fields{
+		"component": "image_sanitizer",
+		"executor":  "claude",
+		"action":    "strip_image_blocks",
+		"replaced":  len(targets),
+	}).Debug("claude executor: replaced image blocks with text placeholder for text-only upstream")
+	return body
 }
 
 // sanitizeClaudeWebSearchDomains removes empty allowed_domains/blocked_domains
