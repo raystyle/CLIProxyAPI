@@ -5,11 +5,13 @@ import (
 	"math"
 	"math/big"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -360,4 +362,76 @@ func randomClaudeFuzzDuration(minSec, maxSec int) time.Duration {
 		return time.Duration(minSec) * time.Second
 	}
 	return time.Duration(minSec+int(nBig.Int64())) * time.Second
+}
+
+const (
+	// claudeQuotaBodyCooldownFallback bounds the synthesized cooldown when the
+	// body reports account quota exhaustion without a parseable reset deadline
+	// (balance/resource-pack refusals that only a manual recharge clears).
+	claudeQuotaBodyCooldownFallback = 15 * time.Minute
+	// claudeQuotaBodyCooldownMax caps body-derived cooldowns so vendor timezone
+	// skew or a far-future reset deadline cannot lock a credential out for days.
+	claudeQuotaBodyCooldownMax = 2 * time.Hour
+	// claudeQuotaBodyResetGrace pads a parsed reset deadline so the cooldown
+	// releases slightly after the quota window actually resets.
+	claudeQuotaBodyResetGrace = 30 * time.Second
+)
+
+// claudeQuotaBodyResetRe matches a reset deadline embedded in vendor quota
+// messages. Chinese phrasing puts the deadline before the verb ("您的限额将在
+// 2026-10-24 14:43:04 重置"), English after it ("resets at 2026-10-24
+// 14:43:04"), so any full datetime inside an already quota-gated message is
+// the deadline.
+var claudeQuotaBodyResetRe = regexp.MustCompile(`(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})`)
+
+// ParseClaudeQuotaBodyReset inspects a 429 body for account-level quota
+// exhaustion that the response headers do not describe. Anthropic-compatible
+// relays (e.g. bigmodel) report window exhaustion or balance depletion only in
+// the JSON body, with no Anthropic rate-limit headers; without this parse the
+// conductor classifies those as ordinary model-level 429s whose sub-second
+// backoff expires immediately, so a dead credential keeps winning selection
+// and each request pays a wasted upstream roundtrip. It returns a bounded
+// cooldown duration, or nil when the body does not look like an account quota
+// refusal.
+//
+// Reset deadlines are parsed as UTC on purpose: a vendor stamp in local time
+// then only extends the cooldown (bounded by claudeQuotaBodyCooldownMax), never
+// releases it early.
+func ParseClaudeQuotaBodyReset(body []byte, now time.Time) *time.Duration {
+	message := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+	if message == "" {
+		message = strings.TrimSpace(gjson.GetBytes(body, "error").String())
+	}
+	if message == "" {
+		message = strings.TrimSpace(string(body))
+	}
+	if message == "" || !claudeBodyIndicatesAccountQuota(message) {
+		return nil
+	}
+	cooldown := claudeQuotaBodyCooldownFallback
+	if m := claudeQuotaBodyResetRe.FindStringSubmatch(message); m != nil {
+		if deadline, errParse := time.ParseInLocation("2006-01-02 15:04:05", strings.Replace(m[1], "T", " ", 1), time.UTC); errParse == nil {
+			if untilReset := deadline.Sub(now) + claudeQuotaBodyResetGrace; untilReset > cooldown {
+				cooldown = untilReset
+			}
+		}
+	}
+	if cooldown > claudeQuotaBodyCooldownMax {
+		cooldown = claudeQuotaBodyCooldownMax
+	}
+	d := cooldown
+	return &d
+}
+
+// claudeBodyIndicatesAccountQuota matches vendor quota refusal wording: Chinese
+// window/balance exhaustion (bigmodel style) plus generic English account limit
+// phrases. Model-scoped burst errors stay unmatched on purpose so they keep the
+// ordinary model-level 429 path.
+func claudeBodyIndicatesAccountQuota(message string) bool {
+	if strings.Contains(message, "使用上限") || strings.Contains(message, "余额不足") || strings.Contains(message, "配额") {
+		return true
+	}
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "usage limit") ||
+		(strings.Contains(lower, "insufficient") && strings.Contains(lower, "balance"))
 }

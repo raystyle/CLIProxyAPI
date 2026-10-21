@@ -708,6 +708,17 @@ func classifyClaudeUpstreamErrorWithCooling(statusCode int, headers http.Header,
 		if claudeBodyIndicatesFastModeCredits(body) {
 			return claudeEntitlementError{err}
 		}
+		// Vendor quota exhaustion reported only in the body (no Anthropic
+		// rate-limit headers): synthesize a bounded cooldown so a dead
+		// credential leaves the rotation instead of winning selection again
+		// after the sub-second model-level backoff expires.
+		if !modelLevelCooling && retryAfter == nil {
+			if bodyQuota := helps.ParseClaudeQuotaBodyReset(body, time.Now()); bodyQuota != nil {
+				quotaErr := claudeRateLimitError{statusErr: err, credentialScoped: true}
+				quotaErr.retryAfter = bodyQuota
+				return quotaErr
+			}
+		}
 		// Ordinary model-level Claude 429 (not a unified 5h/7d rejection)
 		return claudeRateLimitError{statusErr: err, credentialScoped: false}
 	}
