@@ -79,44 +79,76 @@ func sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx context.Context, body 
 		sanitized, report = sigcompat.SanitizeClaudeMessagesForClaudeUpstream(body, baseModel, preserveEmptyThinkingBlocks...)
 		logClaudeSignatureSanitizeReport(ctx, baseModel, report)
 	}
-	return helps.NormalizeClaudeToolCallIDs(sanitizeClaudeImageBlocks(sanitizeClaudeWebSearchDomains(sanitized)))
+	return helps.NormalizeClaudeToolCallIDs(sanitizeClaudeBlocksForTextOnlyUpstream(sanitizeClaudeWebSearchDomains(sanitized)))
 }
 
 // claudeTextOnlyImagePlaceholder replaces image content blocks on their way to
 // text-only Anthropic-compatible upstreams. GLM's /api/anthropic face rejects
-// content.type outside ['text'] (tool_use/tool_result/thinking pass, image does
-// not) with a hard 400, which bricks any client session once a Read on an image
-// file lands in history (2026-10-20 lan-win incident: 40 consecutive 400s).
-// The placeholder keeps the request legal and the omission visible to the
-// model. Fleet fork note: applied unconditionally on this executor because
-// every claude-api-key upstream here is a text-only compat face; if a genuine
-// Anthropic (vision-capable) upstream is ever added, gate this on
+// content.type outside a narrow allowed set with a hard 400 ("messages.content.type
+// 参数非法"), which bricks any client session once the offending block lands in
+// history (2026-10-20 lan-win incident: tool_result carrying base64 PNG, 40
+// consecutive 400s; 2026-10-22 recurrence: non-image blocks after images were
+// patched). The placeholder keeps the request legal and the omission visible
+// to the model. Fleet fork note: applied unconditionally on this executor
+// because every claude-api-key upstream here is a text-only compat face; if a
+// genuine Anthropic (vision-capable) upstream is ever added, gate this on
 // isAnthropicUpstreamURL before forwarding.
 const claudeTextOnlyImagePlaceholder = "[image omitted: text-only upstream]"
 
-// sanitizeClaudeImageBlocks walks messages.content and nested tool_result
-// content arrays, replacing every image block with a text placeholder.
-func sanitizeClaudeImageBlocks(body []byte) []byte {
+// claudeTextOnlyAllowedBlockTypes is the whitelist of content block types
+// forwarded as-is. text/tool_use/tool_result/thinking are empirically accepted
+// by GLM's face; every other type seen in the wild (image, document from PDF
+// reads, redacted_thinking, search_result, server_tool_use,
+// web_search_tool_result, ...) is rejected, so anything unknown is flattened
+// to a text placeholder rather than enumerated one 400 at a time.
+var claudeTextOnlyAllowedBlockTypes = map[string]struct{}{
+	"text":        {},
+	"tool_use":    {},
+	"tool_result": {},
+	"thinking":    {},
+}
+
+func claudeTextOnlyBlockPlaceholder(blockType string) string {
+	if blockType == "image" {
+		return claudeTextOnlyImagePlaceholder
+	}
+	return fmt.Sprintf("[omitted %s block: text-only upstream]", blockType)
+}
+
+// sanitizeClaudeBlocksForTextOnlyUpstream walks messages.content and nested
+// tool_result content arrays, replacing every block whose type is outside
+// claudeTextOnlyAllowedBlockTypes with a text placeholder.
+func sanitizeClaudeBlocksForTextOnlyUpstream(body []byte) []byte {
 	messages := gjson.GetBytes(body, "messages")
 	if !messages.Exists() || !messages.IsArray() {
 		return body
 	}
-	var targets []string
+	var targets [][2]string // {json path, block type}
 	messages.ForEach(func(mi, message gjson.Result) bool {
 		content := message.Get("content")
 		if !content.Exists() || !content.IsArray() {
 			return true
 		}
 		content.ForEach(func(ci, block gjson.Result) bool {
-			switch block.Get("type").String() {
-			case "image":
-				targets = append(targets, fmt.Sprintf("messages.%d.content.%d", mi.Int(), ci.Int()))
-			case "tool_result":
+			blockType := block.Get("type").String()
+			if blockType != "" {
+				if _, allowed := claudeTextOnlyAllowedBlockTypes[blockType]; !allowed {
+					targets = append(targets, [2]string{
+						fmt.Sprintf("messages.%d.content.%d", mi.Int(), ci.Int()), blockType,
+					})
+				}
+			}
+			if blockType == "tool_result" {
 				nested := block.Get("content")
 				if nested.Exists() && nested.IsArray() {
 					nested.ForEach(func(ni, nestedBlock gjson.Result) bool {
-						if nestedBlock.Get("type").String() == "image" {
-							targets = append(targets, fmt.Sprintf("messages.%d.content.%d.content.%d", mi.Int(), ci.Int(), ni.Int()))
+						nestedType := nestedBlock.Get("type").String()
+						if nestedType != "" {
+							if _, allowed := claudeTextOnlyAllowedBlockTypes[nestedType]; !allowed {
+								targets = append(targets, [2]string{
+									fmt.Sprintf("messages.%d.content.%d.content.%d", mi.Int(), ci.Int(), ni.Int()), nestedType,
+								})
+							}
 						}
 						return true
 					})
@@ -129,20 +161,23 @@ func sanitizeClaudeImageBlocks(body []byte) []byte {
 	if len(targets) == 0 {
 		return body
 	}
-	for _, path := range targets {
-		if updated, errSet := sjson.SetBytes(body, path, map[string]any{
+	kinds := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if updated, errSet := sjson.SetBytes(body, target[0], map[string]any{
 			"type": "text",
-			"text": claudeTextOnlyImagePlaceholder,
+			"text": claudeTextOnlyBlockPlaceholder(target[1]),
 		}); errSet == nil {
 			body = updated
 		}
+		kinds = append(kinds, target[1])
 	}
 	log.WithFields(log.Fields{
-		"component": "image_sanitizer",
-		"executor":  "claude",
-		"action":    "strip_image_blocks",
-		"replaced":  len(targets),
-	}).Debug("claude executor: replaced image blocks with text placeholder for text-only upstream")
+		"component":   "text_only_sanitizer",
+		"executor":    "claude",
+		"action":      "strip_non_text_blocks",
+		"replaced":    len(targets),
+		"block_types": kinds,
+	}).Debug("claude executor: replaced non-text blocks with text placeholders for text-only upstream")
 	return body
 }
 
